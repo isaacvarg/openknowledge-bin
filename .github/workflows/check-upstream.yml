@@ -1,0 +1,81 @@
+name: Check upstream release
+
+# Opens an issue when OpenKnowledge publishes a release newer than the one on
+# the AUR, and closes it once the AUR catches up. It never publishes anything.
+
+on:
+  schedule:
+    - cron: "17 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: check-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare upstream with the AUR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          latest="$(gh api repos/inkeep/open-knowledge/releases/latest --jq .tag_name)"
+          latest="${latest#v}"
+
+          # The AUR is what users install; fall back to this repo's PKGBUILD
+          # if the AUR API has no answer.
+          aur="$(curl -fsSL --retry 3 'https://aur.archlinux.org/rpc/v5/info?arg[]=openknowledge-bin' \
+            | jq -r '.results[0].Version // empty' || true)"
+          current="${aur%-*}"
+          if [ -z "$current" ]; then
+            current="$(sed -n 's/^pkgver=//p' openknowledge-bin/PKGBUILD)"
+            echo "::notice::AUR API returned nothing; using PKGBUILD pkgver $current"
+          fi
+          echo "upstream: $latest   packaged: $current"
+
+          prefix="openknowledge-bin: OpenKnowledge v"
+          open_issues="$(gh issue list --state open --limit 100 --json number,title \
+            --jq "map(select(.title | startswith(\"$prefix\")))")"
+
+          newest="$(printf '%s\n%s\n' "$latest" "$current" | sort -V | tail -1)"
+          if [ "$latest" = "$current" ] || [ "$newest" = "$current" ]; then
+            echo "Up to date."
+            for n in $(jq -r '.[].number' <<<"$open_issues"); do
+              gh issue close "$n" --comment "openknowledge-bin $current is on the AUR."
+            done
+            exit 0
+          fi
+
+          title="${prefix}${latest} is available"
+          for n in $(jq -r --arg t "$title" 'map(select(.title != $t)) | .[].number' <<<"$open_issues"); do
+            gh issue close "$n" --comment "Superseded by v$latest."
+          done
+
+          if jq -e --arg t "$title" 'any(.title == $t)' <<<"$open_issues" >/dev/null; then
+            echo "Issue already open for v$latest."
+            exit 0
+          fi
+
+          gh issue create --title "$title" --body "$(cat <<EOF
+          OpenKnowledge [v$latest](https://github.com/inkeep/open-knowledge/releases/tag/v$latest) is out; the AUR has $current.
+
+          To publish it:
+
+          \`\`\`bash
+          ./update-aur.sh --install --push
+          \`\`\`
+
+          Check the build output for new dependencies or layout changes before pushing.
+          This issue closes itself once the AUR is updated.
+          EOF
+          )"
